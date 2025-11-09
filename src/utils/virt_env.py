@@ -54,6 +54,31 @@ def install_requirements() -> str:
 def remove_pkg(package_name: str) -> str:
     return str(subprocess.run([pip_path, 'uninstall', package_name, '-y'], capture_output=True))
 
+# Install and configure ipykernel for use in Jupyter notebooks
+def env_kernel(pip_path: str, kernel_name: str = 'halal_food_classifier') -> str:
+    try:
+        # Install ipykernel in the virtual environment
+        install_result = subprocess.run([pip_path, 'install', 'ipykernel'], 
+                                        capture_output=True, text=True, check=True)
+        print(f'ipykernel installed: {install_result.stdout}')
+        
+        # Get the Python executable path from the virtual environment
+        if os.name == 'nt':
+            python_path = os.path.join(root_path, 'Scripts', 'python')
+        else:
+            python_path = os.path.join(root_path, 'bin', 'python')
+        
+        # Register the kernel with Jupyter
+        kernel_result = subprocess.run([python_path, '-m', 'ipykernel', 'install', 
+                                        '--user', '--name', kernel_name, 
+                                        '--display-name', f'Python ({kernel_name})'],
+                                        capture_output=True, text=True, check=True)
+        
+        return f'ipykernel configured successfully: {kernel_result.stdout}'
+    
+    except subprocess.CalledProcessError as e:
+        return f'failed to configure ipykernel: {e.stderr}'
+
 
 requirements_file = os.path.join(pathlib.Path(__file__).parent.parent.parent.absolute(), 'requirements.txt')
 
