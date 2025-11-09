@@ -4,4 +4,8 @@ pandas
 scikit-learn
 Pillow
 flask
-
+pyzbar
+pytesseract
+opencv-python
+requests
+ultralytics

@@ -1,0 +1,4 @@
+streamlit
+ultralytics
+pillow
+torch  # Or torch torchvision torchaudio if GPU
