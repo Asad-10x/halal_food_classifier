@@ -1,1 +1,6 @@
 tmp/
+__pycache__/
+.env/
+.idea/
+data/
+test.py
