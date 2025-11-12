@@ -1,12 +1,11 @@
 import streamlit as st
 from ultralytics import YOLO
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import io
 import os
-from pyzbar import zbar_library
-from pyzbar.pyzbar import decode
-import utils.virt_env as venv
+from pyzbar import zbar_library as zbarlib
+from pyzbar.pyzbar import decode, ZBarSymbol
 
 
 # -----------------------------
@@ -65,36 +64,25 @@ st.markdown("<p class='subtitle'>Upload or capture a product image to detect hal
 
 col1, col2 = st.columns([1,1])
 with col1:
-    uploaded_file = st.file_uploader("Upload Image", type=["jpg","jpeg","png"], label_visibility="collapsed")
+    uploaded_file = st.file_uploader("Upload Logo Image", type=["jpg","jpeg","png"], label_visibility="collapsed")
 with col2:
     camera_image = st.camera_input("Or Take a Photo", label_visibility="collapsed")
-
-image_source = camera_image if camera_image else uploaded_file
-
+image_source_a = uploaded_file or camera_image
 # -----------------------------
 # Processing
 # -----------------------------
-if image_source is not None:
-    pil_image = Image.open(image_source).convert("RGB")
-    st.image(pil_image, caption="Input Image", use_container_width=True)
+if image_source_a is not None:
+    pil_image = Image.open(image_source_a).convert("RGB")
+    st.image(pil_image, caption="Input Image", width='stretch')
 
     # Halal Detection
     with st.spinner("Detecting Halal Logos..."):
-        halal_results = halal_model.predict(pil_image, conf=halal_conf, verbose=False)[0]
-
-    # Barcode Detection
-    with st.spinner("Detecting Barcodes..."):
-        barcode_results = barcode_model.predict(pil_image, conf=barcode_conf, verbose=False)[0]
-
-    # Combine Annotated Outputs (barcode overlay last)
+        halal_results = halal_model.predict(pil_image, conf=halal_conf, verbose=True)[0]
     annotated_pil = halal_results.plot(line_width=3, font_size=1.2, pil=True)
-    annotated_pil = barcode_results.plot(line_width=2, font_size=1.0, pil=True)
 
-    st.image(annotated_pil, caption="Detection Results", use_container_width=True)
-
-    # -----------------------------
-    # Halal Results
-    # -----------------------------
+# -----------------------------
+# Halal Results
+# -----------------------------
     if halal_results.boxes and len(halal_results.boxes)>0:
         st.markdown("<div class='success-badge'>HALAL CERTIFIED</div>", unsafe_allow_html=True)
         st.success(f"**{len(halal_results.boxes)} halal logo(s) detected!**")
@@ -107,46 +95,75 @@ if image_source is not None:
     else:
         st.markdown("<div class='warning-badge'>NO HALAL LOGO FOUND</div>", unsafe_allow_html=True)
 
-    # -----------------------------
-    # Manual ZBar DLL Load + Barcode Decoding
-    # -----------------------------
-    # dll_path = r"C:\Users\My pc\Downloads\zbar-x64\libzbar-64.dll"  # 👈 adjust this path
+# -----------------------------
+#  Barcode Decoding
+# -----------------------------
 
+col3 = st.columns([1])[0]
+with col3:
+    barcode_upload = st.file_uploader("Upload Barcode Image", type=["jpg","jpeg","png"], label_visibility="collapsed")
+
+image_source_b = barcode_upload or None
+annotated_pil_b = None
+if image_source_b is not None:
+    pil_b = Image.open(image_source_b).convert("RGB")
+    # st.image(pil_b, caption="Barcode Image", width='stretch') # shows uploaded image (redundant)
+
+    decoded_barcodes = []
     try:
-        if os.path.exists(dll_path):
-            zbar_library.load(dll_path)
-            decoded_barcodes = decode(pil_image)
-        else:
-            st.warning(f"⚠️ libzbar DLL not found at: {dll_path}\nDownload from https://github.com/NaturalHistoryMuseum/pyzbar/releases")
-            decoded_barcodes = []
+        decoded_barcodes = decode(pil_b)
     except Exception as e:
-        st.error(f"❌ Failed to load libzbar or decode barcodes: {e}")
+        st.warning(f"Could not decode barcodes with pyzbar: {e}")
         decoded_barcodes = []
 
-    if barcode_results.boxes and len(barcode_results.boxes)>0:
-        st.markdown("### 📦 Barcode Detected")
-        st.info(f"{len(barcode_results.boxes)} barcode(s) found!")
+    st.markdown("### Decoding Barcodes with pyzbar")
+    st.write(f"Found {len(decoded_barcodes)} decoded object(s)")
 
-        if decoded_barcodes:
-            st.markdown("#### Decoded Barcodes:")
-            for i, obj in enumerate(decoded_barcodes):
-                data = obj.data.decode("utf-8")
-                typ = obj.type
-                st.markdown(f"**{i+1}. Type:** `{typ}`  |  **Data:** `{data}`")
-        else:
-            st.warning("Barcode detected, but could not decode. Try a clearer image.")
+    # Draw pyzbar annotations (rectangles, polygons, text)
+    annotated_decode = pil_b.copy()
+    draw = ImageDraw.Draw(annotated_decode)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=20)
+    except Exception:
+        font = ImageFont.load_default()
 
-    # -----------------------------
-    # Download annotated result
-    # -----------------------------
-    buf = io.BytesIO()
-    annotated_pil.save(buf, format="PNG")
-    st.download_button(
-        label="⬇️ Download Annotated Result",
-        data=buf.getvalue(),
-        file_name="halal_barcode_result.png",
-        mime="image/png"
-    )
+    if decoded_barcodes:
+        for d in decoded_barcodes:
+            # rect: left, top, width, height
+            l, t, w, h = d.rect.left, d.rect.top, d.rect.width, d.rect.height
+            draw.rectangle(((l, t), (l + w, t + h)), outline=(0, 0, 255), width=3)
+            if getattr(d, 'polygon', None):
+                try:
+                    pts = [(p.x, p.y) for p in d.polygon]
+                    draw.polygon(pts, outline=(0, 255, 0))
+                except Exception:
+                    pass
+            try:
+                text = d.data.decode('utf-8')
+            except Exception:
+                text = str(d.data)
+            draw.text((l, t + h), text, fill=(255, 0, 0), font=font)
+
+        st.image(annotated_decode, caption="Decoded Barcodes (pyzbar)", width='stretch')
+
+        st.markdown("#### Decoded Barcodes:")
+        for i, obj in enumerate(decoded_barcodes):
+            data = obj.data.decode("utf-8")
+            typ = obj.type
+            st.markdown(f"**{i+1}. Type:** `{typ}`  |  **Data:** `{data}`")
+    else:
+        st.warning("No barcodes decoded by pyzbar. Try a clearer image or ensure libzbar is available.")
+    result_img = annotated_pil_b # add an indent if uncomment above block
+
+    if result_img is not None:
+        buf = io.BytesIO()
+        result_img.save(buf, format="PNG")
+        st.download_button(
+            label="⬇️ Download Annotated Result",
+            data=buf.getvalue(),
+            file_name="halal_barcode_result.png",
+            mime="image/png"
+        )
 
 else:
     st.markdown("""
