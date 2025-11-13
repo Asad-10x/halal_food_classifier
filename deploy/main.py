@@ -1,10 +1,13 @@
 import streamlit as st                                       # pyright: ignore[reportMissingImports]
 from ultralytics import YOLO                                 # type: ignore
 from PIL import Image, ImageDraw, ImageFont                  # pyright: ignore[reportMissingImports]
+import pandas as pd
+import re
 import numpy as np                                           # pyright: ignore[reportMissingImports]
 import io, os
 from pyzbar import zbar_library as zbarlib                   # pyright: ignore[reportMissingImports]
 from pyzbar.pyzbar import decode, ZBarSymbol                 # pyright: ignore[reportMissingImports]
+import pytesseract as ocr
 
 
 
@@ -204,8 +207,8 @@ if image_source_a is not None:
         st.success(f"**{len(halal_results.boxes)} halal logo(s) detected!**")
         st.markdown("#### Detected Logos:")
         for i, box in enumerate(halal_results.boxes):
-            cls_id = int(box.cls.cpu().numpy())
-            conf = float(box.conf.cpu().numpy())
+            cls_id = int(box.cls.cpu().numpy().item())
+            conf = float(box.conf.cpu().numpy().item())
             label = halal_model.names[cls_id]
             st.markdown(f"**{i+1}. {label.title()}** – Confidence: {conf:.2f}")
     else:
@@ -298,11 +301,200 @@ if result_img is not None:
         file_name="halal_barcode_result.png",
         mime="image/png"
     )
+    
+
+# -----------------------------
+# Ingredient List OCR
+# -----------------------------
+
+def text_cleanup(text):
+    if not text or not isinstance(text, str):
+        return []
+    text = text.lower()
+    start_idx = -1
+    for marker in ["ingredients:", "contains:", "ingredients :", "contains :"]:
+        idx = text.find(marker)
+        if idx != -1:
+            start_idx = idx + len(marker)
+            break
+
+    if start_idx == -1:
+        return []
+
+    # slice text from ingredients marker
+    text = text[start_idx:]
+
+    end_idx = text.find('.')
+    if end_idx != -1:
+        text = text[:end_idx]
+    
+    # ingredients = [item.strip() for item in text.split(',') if item.strip()]
+    ingredients = [item.strip() for item in text.split(',') ]
+    return ingredients
+
+
+def process_ds(
+    filepath: str,
+    ratio_threshold: float = 0.6,
+    save_to: str = "ingredient_haram_analysis.csv"
+):
+    """
+    Analyze halal/haram frequency of ingredients in a dataset.
+
+    Parameters:
+    ----------
+    filepath : str
+        Path to your CSV file.
+    ratio_threshold : float
+        Threshold above which ingredient is considered Haram.
+    save_to : str
+        Output CSV file to save results.
+
+    Returns:
+    -------
+    pd.DataFrame
+        A DataFrame containing halal/haram counts, ratios, and classifications.
+    """
+
+    # --- Load dataset ---
+    df = pd.read_csv(filepath, sep=',', engine='python')
+
+    # --- Clean up ---
+    df.columns = df.columns.str.strip().str.lower()
+    df['text'] = df['text'].astype(str).str.lower().str.replace('"', '').str.strip()
+    df['label'] = df['label'].astype(str).str.lower().str.replace('"', '').str.strip()
+
+    # --- Tokenization & Cleaning ---
+    df['text'] = df['text'].str.replace(r'[\(\)\[\];:/\-]', ' ', regex=True)
+
+    # stopwords (useless connectors)
+    stopwords = {
+        'contains', 'and', 'or', 'less', 'of', 'one', 'more', 'made', 'with',
+        'from', 'the', 'a', 'an', 'to', 'as', 'on', 'in', 'by', 'for', 'it', 'is'
+    }
+
+    ingredient_rows = []
+    for _, row in df.iterrows():
+        tokens = [t.strip() for t in row['text'].split() if t.strip() and t not in stopwords]
+        for token in tokens:
+            ingredient_rows.append({'ingredient': token, 'label': row['label']})
+
+    ingredients_df = pd.DataFrame(ingredient_rows)
+
+    # --- Counting halal vs haram occurrences ---
+    counts = ingredients_df.groupby(['ingredient', 'label']).size().unstack(fill_value=0)
+
+    # Ensure columns exist
+    if 'haram' not in counts.columns:
+        counts['haram'] = 0
+    if 'halal' not in counts.columns:
+        counts['halal'] = 0
+
+    # --- Compute ratios and classify ---
+    counts['total'] = counts.sum(axis=1)
+    counts['haram_ratio'] = counts['haram'] / counts['total']
+    counts['classification'] = counts['haram_ratio'].apply(
+        lambda r: 'Haram' if r > ratio_threshold else 'Halal'
+    )
+
+    # --- Sort & Save ---
+    counts_sorted = counts.sort_values('haram_ratio', ascending=False)
+    counts_sorted.to_csv(save_to)
+
+    # print(counts_sorted.head(15))
+    return counts_sorted
+
+
+# a func that finds an ingredient status from data
+def stat(ing: str, ds: pd.DataFrame):
+    """
+    Find ingredient classification with fuzzy matching.
+    
+    Parameters:
+    -----------
+    ing : str
+        Ingredient name to search for
+    ds : pd.DataFrame
+        Dataset with 'ingredient', 'classification', 'haram_ratio' columns
+    
+    Returns:
+    --------
+    tuple : (classification, ratio) or ("Unknown", None)
+    """
+    ing = ing.lower().strip()
+    
+    # Remove ingredient codes like (e414) or (150d) from the search term
+    ing_clean = re.sub(r'\s*\([^)]*\)\s*', '', ing).strip()
+    
+    # Prepare dataset
+    ds_temp = ds.copy()
+    ds_temp['ingredient'] = ds_temp['ingredient'].astype(str).str.lower().str.strip()
+    
+    # Try exact match first
+    row = ds_temp[ds_temp['ingredient'] == ing_clean]
+    if not row.empty:
+        classification = row.iloc[0]['classification']
+        ratio = row.iloc[0]['haram_ratio']
+        return classification, ratio
+    
+    # Try substring match (ingredient name is part of database entry)
+    row = ds_temp[ds_temp['ingredient'].str.contains(ing_clean, regex=False, na=False)]
+    if not row.empty:
+        classification = row.iloc[0]['classification']
+        ratio = row.iloc[0]['haram_ratio']
+        return classification, ratio
+    
+    # Try reverse substring match (database entry is part of search term)
+    row = ds_temp[ds_temp['ingredient'].apply(lambda x: x in ing_clean)]
+    if not row.empty:
+        classification = row.iloc[0]['classification']
+        ratio = row.iloc[0]['haram_ratio']
+        return classification, ratio
+    
+    return "Unknown", None
+
+# s_counts  = process_ds(
+#     filepath="../data/ingredients_cleaned_dataset.csv",
+#     ratio_threshold=0.6,
+#     save_to="../data/ingredient_haram_analysis.csv"
+# )
+
+s = pd.read_csv("../data/ingredient_haram_analysis.csv")
+dataset = pd.DataFrame(s).reset_index()
+
+
+col3 = st.columns([1])[0]
+with col3:
+    ingredient_img = st.file_uploader("Upload Ingredient Image", type=["jpg","jpeg","png"], label_visibility="collapsed")
+image_source_c = ingredient_img or None
+if image_source_c is not None:
+    pil_c = Image.open(image_source_c).convert("RGB")
+    st.image(pil_c, caption="Ingredient Image", width='stretch')
+    with st.spinner("Extracting Text from Ingredient Image..."):
+        ocr_text = ocr.image_to_string(pil_c)
+    if ocr_text.strip():
+        st.markdown("### Extracted Ingredient List:")
+        ing_list = ",".join(text_cleanup(ocr_text))
+        st.text_area("Ingredients:", value=ing_list, height=200)
+        st.markdown("### Ingredient Label List:")
+        labels = []
+        for ing in ing_list.split(","):
+            ing = ing.strip()
+            if ing:  # Skip empty strings
+                classification, ratio = stat(ing, dataset)
+                if ratio is not None:
+                    labels.append(f"{ing}: {classification} (Score Ratio: {ratio:.2f})")
+                else:
+                    labels.append(f"{ing}: {classification}")
+        st.text_area("Ingredients Labeling:", value="\n".join(labels), height=200)
+    else:
+        st.warning("No text could be extracted from the image. Try a clearer image.")
+
 # -----------------------------
 # Footer
 # -----------------------------
 st.markdown("""
 <div class='footer'>
-Built with ❤️ using YOLOv8 & Streamlit | Halal Logo & Barcode Verification
+Built using YOLOv8 & Streamlit | Halal Logo & Barcode Verification
 </div>
 """, unsafe_allow_html=True)
